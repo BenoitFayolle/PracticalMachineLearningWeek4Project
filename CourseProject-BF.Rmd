@@ -1,0 +1,161 @@
+---
+title: 'Practical Machine Learning: week 4 course project'
+author: "Benoît Fayolle"
+date: "24 janvier 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,fig.width=9, fig.height=6)
+```
+
+###Synopsis
+6 participants are asked to perform a weight lifting exercise: the Unilateral Dumbbell Biceps Curl. Each participant has 4 acceleration sensors on different part of his body and one on the dumbbell. They are asked to perform five variations over the exercise. Only one of them being the correct way.
+In this document, we load the data recorded during this experience, analyze it and construct a machine learning algorithm to predict "how well" the exercise is done.
+
+###Loading & Cleaning
+```{r loading, cache=TRUE}
+training<-read.csv("pml-training.csv",sep=",")
+testing<-read.csv("pml-testing.csv",sep=",")
+```
+
+It is easy to verify that the variable raw_timestamp_part_1 is the number of seconds since 1970-01-01 and the variable raw_timestamp_part_2 is the division of this second.
+A variable timestamp is created by agregating the two parts and substracting the first value for readability. The absolute value of time is not important in the phenomenon we are analysing
+```{r processing, cache=FALSE}
+as.POSIXlt(training$raw_timestamp_part_1,"%S",origin="1970-01-01 00:00:00")[1:3]
+head(training$cvtd_timestamp,3)
+
+training$timestamp<-training$raw_timestamp_part_1+training$raw_timestamp_part_2/1e6
+training$timestamp<-training$timestamp-training$timestamp[1]
+testing$timestamp<-testing$raw_timestamp_part_1+testing$raw_timestamp_part_2/1e6
+testing$timestamp<-testing$timestamp-testing$timestamp[1]
+str(training[,1:15])
+```
+As one can see, some numeric/continuous variables have been processed as factors by the read.csv() function. kurtosis_roll_belt is the first example.
+It is necessary to transform them back to their true numeric value to make a correct inference.
+```{r factor to numeric, cache=FALSE,echo=TRUE}
+iNumeric<-grep("kurtosis|skewness|max|min|amplitude|total",names(training))
+for (i in iNumeric){
+        if(class(training[,i])=="factor"){
+                training[,i]<-suppressWarnings(as.numeric(as.character(training[,i])))
+                testing[,i]<-suppressWarnings(as.numeric(as.character(testing[,i])))
+        }
+}
+```
+a lot of variables in the dataset have almost only NA values
+```{r NA?, cache=FALSE,echo=TRUE}
+table(apply(training,2,function(x){length(which(is.na(x)))}))
+```
+The training dataset having 19622 observations, all the variables having 19216 or more NA values are removed from the analysis:
+```{r NA out, cache=FALSE,echo=TRUE}
+iNA<-which(apply(training,2,function(x){length(which(is.na(x)))})>=19216)
+training<-training[,-iNA];testing<-testing[,-iNA]
+```
+Also dropping:
+
+* the X variable which is just a index variable
+* other timestamps
+* new window and num_window which are not physical variable records
+
+```{r dropping useless vars, cache=FALSE,echo=TRUE,message=FALSE}
+library(dplyr)
+training<-select(training,-X,-raw_timestamp_part_1,-raw_timestamp_part_2,-cvtd_timestamp,
+-new_window,-num_window)
+testing<-select(testing,-X,-raw_timestamp_part_1,-raw_timestamp_part_2,-cvtd_timestamp,
+-new_window,-num_window)
+
+
+```
+
+###Structure of the dataset
+The data provided are multiple time series. Even though the weight lifting exercises are typically periodic if they are correctly executed, the periods can vary over time, person and exercise. Let's see how the data breaks down in regards to *user_name* and *classe* variable.
+```{r crossval1, cache=FALSE,echo=TRUE}
+library(ggplot2)
+training$userExercise<-factor(paste(training$user_name,training$classe,sep="_"))
+table(training$userExercise)
+mean(table(training$userExercise))
+training<-training[order(training$timestamp),]
+qplot(training$timestamp,training$classe,col=training$user_name)
+```
+
+As it can be seen in the graphic above, each participant performed the exercises consecutively. Each exercise for each person was recorded with an average 654 sample for each variable. The 5 classes are relatively well balanced.
+
+###Data slicing
+
+Since we are trying to predict a lifting exercise, the signal recorded is a time series that involves periodic phenomena. We could think this require a proper data slicing in chunks since the value of each sample depends on its neighbour. But looking at the testset provided, it would be unnecessary. The testset is composed of just 20 uncorrelated single samples.
+We slice the training data into subtraining and subtesting datasets with the createDataPartition function. To ensure balanced classe in those sub datasets, we use a custom factor we call *userExercise*
+```{r crossval2, cache=FALSE,echo=TRUE}
+library(caret);library(dplyr)
+### sub train/test datasets creation
+trainTemp<-{}
+testTemp<-{}
+for (i in levels(training$userExercise)){ ##loop over the combination of user/classe
+        subtraining<-subset(training,userExercise==i)
+        inTrain<-createDataPartition(y=subtraining$timestamp,p=0.8)$Resample1
+        trainTemp<-rbind(trainTemp,subtraining[inTrain,]) #reconstruct subtrain dataset
+        testTemp<-rbind(testTemp,subtraining[-inTrain,])
+}
+trainTemp<-select(trainTemp,-userExercise,-timestamp,-user_name)
+testTemp<-select(testTemp,-userExercise,-timestamp,-user_name)
+###update factors
+trainTemp<-droplevels(trainTemp);testTemp<-droplevels(testTemp)
+```
+
+```{r dimension reduction, cache=FALSE,echo=TRUE}
+###svd and variance explained
+trainSVD<-svd(select(trainTemp,-classe))
+plot(trainSVD$d^2/sum(trainSVD$d^2),col="blue")
+head(trainSVD$d^2/sum(trainSVD$d^2),12)
+```
+`trainSVD$d^2/sum(trainSVD$d^2)` is the "variance explained" of the dataset.
+The first principal component captures ~55% of the variance in the data set. With the next 10, we have 98% of the variance. We retain these 11 principal components to speed up the training of our model.
+We then use two different models based on classification trees:
+
+* CART model: simple classification tree with the 'rpart' caret version
+* random forest : much more efficient model but compute-intensive
+
+The k-fold method is employed for cross-validation as it appeared to be as efficient in the prediction as the bootstraping method but saving substantial time in the computation.
+```{r training, cache=TRUE,echo=TRUE}
+###precprocessing with PCA
+preObj<-preProcess(select(trainTemp,-classe),method="pca",pcaComp = 11)
+preTrain<-predict(preObj,trainTemp);preTest<-predict(preObj,testTemp)
+
+### CART
+mod1<-train(classe~.,data=preTrain,method="rpart")
+print(confusionMatrix(mod1));print(mod1$finalModel);
+pred1<-predict(mod1,preTest)
+print(confusionMatrix(pred1,reference=preTest$classe))
+### RF with 5 resamples
+trainControlObj<-trainControl(number=5,method="cv",seeds=NA,allowParallel=T)
+mod2<-train(classe~.,data=preTrain,method="rf",trainControl=trainControlObj,
+            verboseIter=T)
+print(confusionMatrix(mod2));print(mod2$finalModel)
+pred2<-predict(mod2,preTest)
+#out of sample error
+print(confusionMatrix(pred2,reference=preTest$classe))
+
+### RF with 10 resamples
+trainControlObj<-trainControl(number=10,method="cv",seeds=NA,allowParallel=T)
+mod3<-train(classe~.,data=preTrain,method="rf",trainControl=trainControlObj,
+            verboseIter=T)
+print(confusionMatrix(mod3));print(mod3$finalModel)
+pred3<-predict(mod3,preTest)
+#out of sample error
+print(confusionMatrix(pred3,reference=preTest$classe))
+```
+
+
+
+###Out of sample error
+Since we have multiple balanced classes, we use the accuracy to evaluate the out of sample error of our classification problem:
+
+* CART: in sample accuracy = 0.41 ; out of sample accuracy = 0.355. Clearly some overfittig here and overall accuracy very bad
+* RF with 5-fold cross-validation: in sample accuracy = 0.9442 ; out of sample accuracy = 0.9647. No overfitting and overall good accuracy.
+* RF with 10-fold cross-validation: in sample accuracy = 0.9443 ; out of sample accuracy = 0.9649. No overfitting and overall good accuracy.
+The number of folds seems to have no influence on the final accuracy of the model.
+We select the 3rd model for our final prediction.
+```{r final prediction, cache=FALSE,echo=TRUE}
+testingPCA<-predict(preObj,select(testing,-user_name,-timestamp))#preprocessing
+predFinal<-predict(mod3,testingPCA)
+print(predFinal)
+```
